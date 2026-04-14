@@ -160,4 +160,4 @@ author before redistributing.
 
 ## Author
 
-[Yash Kadyan](https://github.com/Yash-200608)
+[Yash](https://github.com/Yash-200608)
