@@ -1,0 +1,29 @@
+# Captured keystrokes — never commit these.
+logs/*
+!logs/.gitkeep
+*.log
+
+# Claude Code session data
+.claude/
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
