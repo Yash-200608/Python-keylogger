@@ -18,22 +18,37 @@ keyboard events through the operating system, using the `pynput` library.
 
 - Cross-platform keystroke capture (Windows / macOS / Linux)
 - Human-readable output (special keys rendered as `[ENTER]`, `[BACKSPACE]`, `[UP]`, …)
-- Timestamped log files, each saved to a local `logs/` directory
+- **Foreground window titles** recorded when focus changes (see which app got the keys)
+- **Live status line** — keystroke count, elapsed time, and current app
+- **Live echo mode** (`--live`) — watch tokens appear as you type
+- Simple commands: `start`, `list`, `view`
+- Timestamped log files in a local `logs/` directory
 - Clean stop via a configurable hotkey (`Ctrl + Alt + K` by default)
-- Visible, non-stealth operation — the program announces itself and prints
-  the exact file path it is writing to
+- Visible, non-stealth operation — announces itself and prints the log path
 - Explicit consent prompt on startup
-- Small, well-commented code suitable for reading and learning
+- Session summary with duration and keys/sec
+
+## Quick start
+
+```bash
+python main.py                 # start capturing (same as: python main.py start)
+# type something, switch apps, then press Ctrl+Alt+K to stop
+
+python main.py list            # see recent sessions
+python main.py view <file>     # pretty-print a session
+```
 
 ## Project structure
 
 ```
 Python-keylogger/
-├── main.py            # CLI entry point (banner, consent, argparse)
-├── keylogger.py       # KeyLogger class (event loop, key formatting, log I/O)
+├── main.py            # CLI entry point (start / list / view)
+├── keylogger.py       # KeyLogger class (events, buffering, status)
+├── viewer.py          # Session list + pretty-print
+├── window_info.py     # Foreground window title helpers
 ├── requirements.txt   # Python dependencies
-├── .gitignore         # Excludes logs/, __pycache__, venvs, IDE files
-├── logs/              # Captured sessions land here (git-ignored)
+├── .gitignore
+├── logs/              # Captured sessions (git-ignored)
 └── README.md
 ```
 
@@ -44,85 +59,95 @@ Python-keylogger/
 
 On Linux you may additionally need the X server development headers
 (`python3-xlib` / `libx11-dev`) — see the pynput docs for your distro.
+Optional: `xdotool` for window-title tracking on X11.
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/Yash-200608/Python-keylogger.git
 cd Python-keylogger
 
-# (Recommended) create and activate a virtual environment
 python -m venv venv
 # Windows
 venv\Scripts\activate
 # macOS / Linux
 source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-Run the program from the project root:
+### Capture a session
 
 ```bash
 python main.py
+# or
+python main.py start
 ```
 
 You will see a banner, an ethical-use notice, and a consent prompt.
-Type `y` and press Enter to continue. The logger will print the exact
-log file path it is writing to, then start capturing keystrokes.
+Type `y` and press Enter to continue. A live status line shows key count
+and the focused app. Press **`Ctrl + Alt + K`** to stop.
 
-Press **`Ctrl + Alt + K`** at any time to stop. A summary line is written
-to the log and the total keystroke count is printed to the console.
+### Browse sessions
 
-### Command-line options
+```bash
+python main.py list
+python main.py view keylog_20260802_164500.txt
+python main.py view keylog_20260802_164500      # .txt optional
+```
+
+### Options (`start`)
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `-o`, `--output-dir` | Directory where log files are written. | `./logs` |
-| `-f`, `--filename`   | Fixed log filename instead of a timestamped one. | `keylog_<date>_<time>.txt` |
-| `--stop-char`        | Single letter used with `Ctrl+Alt` to stop the logger. | `k` |
-| `--no-banner`        | Skip the banner and consent prompt (for automated tests). | off |
+| `-o`, `--output-dir` | Directory for log files. | `./logs` |
+| `-f`, `--filename` | Fixed log filename instead of timestamped. | `keylog_<date>_<time>.txt` |
+| `--stop-char` | Letter used with `Ctrl+Alt` to stop. | `k` |
+| `--live` | Echo captured tokens to the console. | off |
+| `--no-windows` | Skip foreground window markers. | off |
+| `--no-status` | Hide the live status line. | off |
+| `--no-banner` | Skip banner and consent (for tests). | off |
 
 Examples:
 
 ```bash
-python main.py                        # default behavior
-python main.py -o mylogs              # write to ./mylogs
-python main.py -f today.txt           # fixed filename
-python main.py --stop-char q          # stop with Ctrl+Alt+Q
+python main.py start --live                 # see keys as they are logged
+python main.py start -o mylogs              # write to ./mylogs
+python main.py start -f today.txt           # fixed filename
+python main.py start --stop-char q          # stop with Ctrl+Alt+Q
+python main.py start --no-windows           # keys only, no app titles
+python main.py list -n 5
+python main.py view today.txt --raw         # dump file unchanged
 ```
 
 ### Example log output
 
 ```
-=== Session started 2026-04-14 21:45:02 ===
-hello world[ENTER]
-this is a test[BACKSPACE][BACKSPACE][BACKSPACE]demo[ENTER]
+=== Session started 2026-08-02 16:45:02 ===
+[WINDOW] Untitled - Notepad
+hello world
 
-=== Session ended 2026-04-14 21:45:47 (34 keystrokes captured) ===
+[WINDOW] Python-keylogger - Cursor
+this is a test[BACKSPACE][BACKSPACE][BACKSPACE]demo
+
+=== Session ended 2026-08-02 16:45:47 (34 keystrokes captured) ===
 ```
 
 ## How it works
 
-1. `main.py` parses CLI flags, prints the ethical notice, and asks for consent.
-2. It constructs a `KeyLogger` (from `keylogger.py`) pointing at a log file
-   inside the output directory.
-3. `KeyLogger.start()` attaches a `pynput.keyboard.Listener` that runs in a
-   background thread managed by pynput. Two callbacks are registered:
-   - `_on_press` — formats the key and appends it to the log file; if the
-     stop combo is held, writes a footer and returns `False` to signal the
-     listener to exit.
-   - `_on_release` — keeps the "currently pressed" set accurate so multi-key
-     combos do not appear sticky.
-4. The main thread blocks on `listener.join()` until the stop combo fires.
+1. `main.py` routes `start` / `list` / `view`, prints the ethical notice, and asks for consent.
+2. `KeyLogger.start()` opens the log file, seeds the current window title, and attaches a `pynput.keyboard.Listener`.
+3. On each key press:
+   - If the stop combo is held → write footer, flush, exit.
+   - If the focused window changed → write a `[WINDOW]` marker.
+   - Otherwise format the key and buffer it (flush on Enter / stop).
+4. A background thread refreshes the status line (count, time, app).
+5. `viewer.py` parses session headers, window markers, and keystroke totals for `list` / `view`.
 
 Modifier keys (Ctrl / Alt / Shift / Cmd / Caps-Lock) are tracked but not
-written to the log on their own — the logger records the character they
-modify (for example, Shift+`a` is logged as `A`).
+written alone — the logger records the character they modify (Shift+`a` → `A`).
 
 ## What this project is **not**
 
@@ -134,23 +159,20 @@ include:
 - Anti-debug, anti-VM, or detection-evasion techniques
 - Screenshot, clipboard, or microphone capture
 
-If you want to extend it for a classroom exercise, consider features that
-make the tool *more* transparent — for example, a live on-screen counter,
-a "redact passwords" mode, or a viewer that replays a session.
-
 ## Troubleshooting
 
-- **`ImportError: No module named pynput`** — make sure your virtual
-  environment is activated and run `pip install -r requirements.txt`.
+- **`ImportError: No module named pynput`** — activate your venv and run
+  `pip install -r requirements.txt`.
 - **macOS: keystrokes are not captured** — grant Terminal (or your
   Python interpreter) *Accessibility* and *Input Monitoring* permissions
   in *System Settings → Privacy & Security*.
 - **Linux: `ImportError: Xlib` or no events** — install `python3-xlib`
   and ensure you are running an X session (Wayland is not supported by
   pynput's key hook).
-- **Windows: some keys print as `[VK_...]`** — this means pynput could
-  not map the scan code to a character, usually on non-US layouts. It is
-  cosmetic; the raw event was still captured.
+- **Window titles missing on Linux** — install `xdotool` (X11) or use
+  `--no-windows`.
+- **Windows: some keys print as `[VK_...]`** — pynput could not map the
+  scan code (often non-US layouts). Cosmetic; the event was still captured.
 
 ## License
 

